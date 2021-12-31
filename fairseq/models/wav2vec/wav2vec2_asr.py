@@ -150,11 +150,30 @@ class Wav2Vec2AsrConfig(FairseqDataclass):
     data: str = II("task.data")
     # this holds the loaded wav2vec args
     w2v_args: Any = None
+    checkpoint_activations: bool = field(
+        default=False, metadata={"help": "checkpoint_activations"}
+    )
+    offload_activations: bool = field(
+        default=False, metadata={"help": "offload_activations"}
+    )
+    min_params_to_wrap: int = field(
+        default=int(1e8),
+        metadata={
+            "help": "minimum number of params for a layer to be wrapped with FSDP() when "
+                    "training with --ddp-backend=fully_sharded. Smaller values will "
+                    "improve memory efficiency, but may make torch.distributed "
+                    "communication less efficient due to smaller input sizes. This option "
+                    "is set to 0 (i.e., always wrap) when --checkpoint-activations or "
+                    "--offload-activations are passed."
+        },
+    )
 
     checkpoint_activations: bool = field(
-        default=False, metadata={"help": "recompute activations and save memory for extra compute"}
+        default=False,
+        metadata={"help": "recompute activations and save memory for extra compute"},
     )
     ddp_backend: str = II("distributed_training.ddp_backend")
+
 
 @dataclass
 class Wav2Vec2CtcConfig(Wav2Vec2AsrConfig):
@@ -193,8 +212,10 @@ class Wav2VecCtc(BaseFairseqModel):
 
         if net_output["padding_mask"] is not None and net_output["padding_mask"].any():
             number_of_classes = logits.size(-1)
-            masking_tensor = torch.ones(number_of_classes) * float("-inf")
-            masking_tensor[0] = float("inf")
+            masking_tensor = torch.ones(
+                number_of_classes, device=logits.device
+            ) * float("-inf")
+            masking_tensor[0] = 0
             logits[net_output["padding_mask"].T] = masking_tensor.type_as(logits)
 
         if normalize:
@@ -268,6 +289,7 @@ class Wav2Vec2Seq2SeqConfig(Wav2Vec2AsrConfig):
     )
     autoregressive: bool = II("task.autoregressive")
 
+
 @register_model("wav2vec_seq2seq", dataclass=Wav2Vec2Seq2SeqConfig)
 class Wav2Vec2Seq2SeqModel(FairseqEncoderDecoderModel):
     def __init__(self, encoder, decoder):
@@ -336,6 +358,9 @@ class Wav2VecEncoder(FairseqEncoder):
             "no_mask_channel_overlap": cfg.no_mask_channel_overlap,
             "encoder_layerdrop": cfg.layerdrop,
             "feature_grad_mult": cfg.feature_grad_mult,
+            "checkpoint_activations": cfg.checkpoint_activations,
+            "offload_activations": cfg.offload_activations,
+            "min_params_to_wrap": cfg.min_params_to_wrap,
         }
 
         if cfg.w2v_args is None:
@@ -394,12 +419,17 @@ class Wav2VecEncoder(FairseqEncoder):
     def load_model_weights(self, state, model, cfg):
         if cfg.ddp_backend == "fully_sharded":
             from fairseq.distributed import FullyShardedDataParallel
+
             for name, module in model.named_modules():
                 if "encoder.layers" in name and len(name.split(".")) == 3:
                     # Only for layers, we do a special handling and load the weights one by one
                     # We dont load all weights together as that wont be memory efficient and may
                     # cause oom
-                    new_dict = {k.replace(name+".", "") : v for (k, v) in state["model"].items() if name+"." in k}
+                    new_dict = {
+                        k.replace(name + ".", ""): v
+                        for (k, v) in state["model"].items()
+                        if name + "." in k
+                    }
                     assert isinstance(module, FullyShardedDataParallel)
                     with module.summon_full_params():
                         module.load_state_dict(new_dict, strict=True)
@@ -409,7 +439,9 @@ class Wav2VecEncoder(FairseqEncoder):
             r = re.compile("encoder.layers.\d.")
             filtered_list = list(filter(r.match, state["model"].keys()))
 
-            new_big_dict = {k: v for (k, v) in state["model"].items() if k not in filtered_list}
+            new_big_dict = {
+                k: v for (k, v) in state["model"].items() if k not in filtered_list
+            }
 
             model.load_state_dict(new_big_dict, strict=False)
         else:
@@ -462,9 +494,9 @@ class Wav2VecEncoder(FairseqEncoder):
                 1, new_order
             )
         if encoder_out["padding_mask"] is not None:
-            encoder_out["padding_mask"] = encoder_out[
-                "padding_mask"
-            ].index_select(0, new_order)
+            encoder_out["padding_mask"] = encoder_out["padding_mask"].index_select(
+                0, new_order
+            )
         return encoder_out
 
     def max_positions(self):
@@ -640,7 +672,7 @@ class TransformerDecoder(FairseqIncrementalDecoder):
                     self_attn_mask=self.buffered_future_mask(x)
                     if incremental_state is None
                     else None,
-                    self_attn_padding_mask=self_attn_padding_mask
+                    self_attn_padding_mask=self_attn_padding_mask,
                 )
                 inner_states.append(x)
 

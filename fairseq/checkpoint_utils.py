@@ -7,15 +7,18 @@ import ast
 import collections
 import contextlib
 import logging
-import numpy as np
 import os
 import re
 import time
 import traceback
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
+import numpy as np
 import torch
+from omegaconf import DictConfig, OmegaConf, open_dict
+
 from fairseq.data import data_utils
 from fairseq.dataclass.configs import CheckpointConfig
 from fairseq.dataclass.utils import (
@@ -25,8 +28,6 @@ from fairseq.dataclass.utils import (
 from fairseq.distributed.fully_sharded_data_parallel import FSDP, has_FSDP
 from fairseq.file_io import PathManager
 from fairseq.models import FairseqDecoder, FairseqEncoder
-from omegaconf import DictConfig, open_dict, OmegaConf
-
 
 logger = logging.getLogger(__name__)
 
@@ -96,10 +97,7 @@ def save_checkpoint(cfg: CheckpointConfig, trainer, epoch_itr, val_loss):
 
         checkpoint_conds[
             "checkpoint.best_{}_{:.3f}{}{}.pt".format(
-                cfg.best_checkpoint_metric,
-                val_loss,
-                rand_sfx,
-                suffix
+                cfg.best_checkpoint_metric, val_loss, rand_sfx, suffix
             )
         ] = worst_best is None or is_better(val_loss, worst_best)
     checkpoint_conds[
@@ -468,9 +466,7 @@ def load_model_ensemble_and_task(
                     and len(state["optimizer_history"]) > 0
                     and "num_updates" in state["optimizer_history"][-1]
                 ):
-                    model.set_num_updates(
-                        state["optimizer_history"][-1]["num_updates"]
-                    )
+                    model.set_num_updates(state["optimizer_history"][-1]["num_updates"])
                 model.load_state_dict(
                     state["model"], strict=strict, model_cfg=cfg.model
                 )
@@ -486,6 +482,34 @@ def load_model_ensemble_and_task(
         # build model for ensemble
         ensemble.append(model)
     return ensemble, cfg, task
+
+
+def load_model_ensemble_and_task_from_hf_hub(
+    model_id,
+    cache_dir: Optional[str] = None,
+    arg_overrides: Optional[Dict[str, Any]] = None,
+    **kwargs: Any,
+):
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        raise ImportError(
+            "You need to install huggingface_hub to use `load_from_hf_hub`. "
+            "See https://pypi.org/project/huggingface-hub/ for installation."
+        )
+
+    library_name = "fairseq"
+    cache_dir = cache_dir or (Path.home() / ".cache" / library_name).as_posix()
+    cache_dir = snapshot_download(
+        model_id, cache_dir=cache_dir, library_name=library_name, **kwargs
+    )
+
+    _arg_overrides = arg_overrides or {}
+    _arg_overrides["data"] = cache_dir
+    return load_model_ensemble_and_task(
+        [p.as_posix() for p in Path(cache_dir).glob("*.pt")],
+        arg_overrides=_arg_overrides,
+    )
 
 
 def checkpoint_paths(path, pattern=r"checkpoint(\d+)\.pt", keep_match=False):
@@ -588,9 +612,8 @@ def _upgrade_state_dict(state):
     # backward compatibility, cfg updates
     if "args" in state and state["args"] is not None:
         # old model checkpoints may not have separate source/target positions
-        if (
-            hasattr(state["args"], "max_positions")
-            and not hasattr(state["args"], "max_source_positions")
+        if hasattr(state["args"], "max_positions") and not hasattr(
+            state["args"], "max_source_positions"
         ):
             state["args"].max_source_positions = state["args"].max_positions
             state["args"].max_target_positions = state["args"].max_positions
@@ -615,13 +638,10 @@ def _upgrade_state_dict(state):
             state["args"].stop_min_lr = state["args"].min_lr
             del state["args"].min_lr
         # binary_cross_entropy / kd_binary_cross_entropy => wav2vec criterion
-        if (
-            hasattr(state["args"], "criterion")
-            and state["args"].criterion in [
-                "binary_cross_entropy",
-                "kd_binary_cross_entropy",
-            ]
-        ):
+        if hasattr(state["args"], "criterion") and state["args"].criterion in [
+            "binary_cross_entropy",
+            "kd_binary_cross_entropy",
+        ]:
             state["args"].criterion = "wav2vec"
         # remove log_keys if it's None (criteria will supply a default value of [])
         if hasattr(state["args"], "log_keys") and state["args"].log_keys is None:
@@ -659,7 +679,9 @@ def _upgrade_state_dict(state):
             ):
                 cfg.task.eval_wer_config.print_alignment = "hard"
             if "generation" in cfg and isinstance(cfg.generation.print_alignment, bool):
-                cfg.generation.print_alignment = "hard" if cfg.generation.print_alignment else None
+                cfg.generation.print_alignment = (
+                    "hard" if cfg.generation.print_alignment else None
+                )
             if (
                 "model" in cfg
                 and "w2v_args" in cfg.model
@@ -772,7 +794,7 @@ def prune_state_dict(state_dict, model_cfg: Optional[DictConfig]):
 
 
 def load_pretrained_component_from_model(
-    component: Union[FairseqEncoder, FairseqDecoder], checkpoint: str
+    component: Union[FairseqEncoder, FairseqDecoder], checkpoint: str, strict: bool = True
 ):
     """
     Load a pretrained FairseqEncoder or FairseqDecoder from checkpoint into the
@@ -798,7 +820,7 @@ def load_pretrained_component_from_model(
             # encoder.input_layers.0.0.weight --> input_layers.0.0.weight
             component_subkey = key[len(component_type) + 1 :]
             component_state_dict[component_subkey] = state["model"][key]
-    component.load_state_dict(component_state_dict, strict=True)
+    component.load_state_dict(component_state_dict, strict=strict)
     return component
 
 
@@ -833,16 +855,16 @@ def load_ema_from_checkpoint(fpath):
     params_dict = collections.OrderedDict()
     new_state = None
 
-    with PathManager.open(fpath, 'rb') as f:
+    with PathManager.open(fpath, "rb") as f:
         new_state = torch.load(
             f,
             map_location=(
-                lambda s, _: torch.serialization.default_restore_location(s, 'cpu')
+                lambda s, _: torch.serialization.default_restore_location(s, "cpu")
             ),
         )
 
         # EMA model is stored in a separate "extra state"
-        model_params = new_state['extra_state']['ema']
+        model_params = new_state["extra_state"]["ema"]
 
         for key in list(model_params.keys()):
             p = model_params[key]
@@ -860,5 +882,5 @@ def load_ema_from_checkpoint(fpath):
                 "ema model weights, is this model trained with EMA?"
             )
 
-    new_state['model'] = params_dict
+    new_state["model"] = params_dict
     return new_state

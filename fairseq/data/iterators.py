@@ -380,7 +380,9 @@ class EpochBatchIterator(EpochBatchIterating):
                 # reset _frozen_batches to refresh the next epoch
                 self._frozen_batches = None
             self._cur_epoch_itr = self._get_iterator_for_epoch(
-                self.epoch, shuffle, fix_batches_to_gpus=fix_batches_to_gpus,
+                self.epoch,
+                shuffle,
+                fix_batches_to_gpus=fix_batches_to_gpus,
             )
         self.shuffle = shuffle
         return self._cur_epoch_itr
@@ -421,7 +423,9 @@ class EpochBatchIterator(EpochBatchIterating):
         if itr_pos > 0:
             # fast-forward epoch iterator
             self._next_epoch_itr = self._get_iterator_for_epoch(
-                self.epoch, shuffle=state_dict.get("shuffle", True), offset=itr_pos,
+                self.epoch,
+                shuffle=state_dict.get("shuffle", True),
+                offset=itr_pos,
             )
             if self._next_epoch_itr is None:
                 if version == 1:
@@ -715,6 +719,7 @@ class GroupedEpochBatchIterator(EpochBatchIterator):
         epoch=0,
         mult_rate=1,
         buffer_size=0,
+        skip_remainder_batch=False,
     ):
         super().__init__(
             dataset,
@@ -726,6 +731,7 @@ class GroupedEpochBatchIterator(EpochBatchIterator):
             num_workers,
             epoch,
             buffer_size,
+            skip_remainder_batch=skip_remainder_batch,
         )
         # level 0: sub-samplers 1: batch_idx 2: batches
         self._frozen_batches = tuple([tuple(sub_batch) for sub_batch in batch_samplers])

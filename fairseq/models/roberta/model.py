@@ -11,6 +11,7 @@ import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from fairseq import utils
 from fairseq.models import (
     FairseqEncoder,
@@ -25,7 +26,6 @@ from fairseq.modules.transformer_sentence_encoder import init_bert_params
 from fairseq.utils import safe_getattr, safe_hasattr
 
 from .hub_interface import RobertaHubInterface
-
 
 logger = logging.getLogger(__name__)
 
@@ -202,6 +202,20 @@ class RobertaModel(FairseqEncoderModel):
             default=0.0,
             help="scaling factor for regularization term in adptive pruning, recommendation is 0.000375",
         )
+        parser.add_argument(
+            "--mha-heads-to-keep",
+            type=int,
+            metavar="D",
+            default=-1,
+            help="number of heads to keep in each multi-head attention module, -1 means keeping all heads",
+        )
+        parser.add_argument(
+            "--ffn-blocks-to-remove",
+            type=int,
+            metavar="D",
+            default=-1,
+            help="number of feedforward blocks to remove in each transformer layer, -1 means keeping all ffn blocks",
+        )
 
     @classmethod
     def build_model(cls, args, task):
@@ -252,9 +266,42 @@ class RobertaModel(FairseqEncoderModel):
             for i in range(layer.self_attn.num_heads):
                 start_idx = i * layer.self_attn.head_dim
                 end_idx = (i + 1) * layer.self_attn.head_dim
-                norm_loss_layer += scaling * (torch.sum(torch.abs(layer.self_attn.q_proj.weight[start_idx:end_idx, ])) + torch.sum(torch.abs(layer.self_attn.q_proj.bias[start_idx:end_idx])))
-                norm_loss_layer += scaling * (torch.sum(torch.abs(layer.self_attn.k_proj.weight[start_idx:end_idx, ])) + torch.sum(torch.abs(layer.self_attn.k_proj.bias[start_idx:end_idx])))
-                norm_loss_layer += scaling * (torch.sum(torch.abs(layer.self_attn.v_proj.weight[start_idx:end_idx, ])) + torch.sum(torch.abs(layer.self_attn.v_proj.bias[start_idx:end_idx])))
+                norm_loss_layer += scaling * (
+                    torch.sum(
+                        torch.abs(
+                            layer.self_attn.q_proj.weight[
+                                start_idx:end_idx,
+                            ]
+                        )
+                    )
+                    + torch.sum(
+                        torch.abs(layer.self_attn.q_proj.bias[start_idx:end_idx])
+                    )
+                )
+                norm_loss_layer += scaling * (
+                    torch.sum(
+                        torch.abs(
+                            layer.self_attn.k_proj.weight[
+                                start_idx:end_idx,
+                            ]
+                        )
+                    )
+                    + torch.sum(
+                        torch.abs(layer.self_attn.k_proj.bias[start_idx:end_idx])
+                    )
+                )
+                norm_loss_layer += scaling * (
+                    torch.sum(
+                        torch.abs(
+                            layer.self_attn.v_proj.weight[
+                                start_idx:end_idx,
+                            ]
+                        )
+                    )
+                    + torch.sum(
+                        torch.abs(layer.self_attn.v_proj.bias[start_idx:end_idx])
+                    )
+                )
 
             norm_loss += norm_loss_layer
         return norm_loss
@@ -263,8 +310,12 @@ class RobertaModel(FairseqEncoderModel):
         ffn_scale_factor = float(self.args.ffn_reg_scale_factor)
         filter_loss = 0
         for layer in self.encoder.sentence_encoder.layers:
-            filter_loss += torch.sum(torch.abs(layer.fc1.weight * ffn_scale_factor)) + torch.sum(torch.abs(layer.fc2.weight * ffn_scale_factor))
-            filter_loss += torch.sum(torch.abs(layer.fc1.bias * ffn_scale_factor)) + torch.sum(torch.abs(layer.fc2.bias * ffn_scale_factor))
+            filter_loss += torch.sum(
+                torch.abs(layer.fc1.weight * ffn_scale_factor)
+            ) + torch.sum(torch.abs(layer.fc2.weight * ffn_scale_factor))
+            filter_loss += torch.sum(
+                torch.abs(layer.fc1.bias * ffn_scale_factor)
+            ) + torch.sum(torch.abs(layer.fc2.bias * ffn_scale_factor))
         return filter_loss
 
     def get_normalized_probs(self, net_output, log_probs, sample=None):
@@ -401,6 +452,19 @@ class RobertaModel(FairseqEncoderModel):
                 if prefix + "classification_heads." + k not in state_dict:
                     logger.info("Overwriting " + prefix + "classification_heads." + k)
                     state_dict[prefix + "classification_heads." + k] = v
+
+            # adapt data2vec models
+            if (
+                "encoder._ema" in state_dict
+                and "encoder.lm_head.weight" not in state_dict
+            ):
+                lm_state = self.encoder.lm_head.state_dict()
+                for k, v in lm_state.items():
+                    state_dict["encoder.lm_head." + k] = v
+
+            for k in list(state_dict.keys()):
+                if k.startswith("encoder.regression_head") or k == "encoder._ema":
+                    del state_dict[k]
 
 
 class RobertaLMHead(nn.Module):

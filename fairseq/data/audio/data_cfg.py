@@ -108,6 +108,9 @@ class S2TDataConfig(object):
         raw audio as inputs."""
         return self.config.get("use_audio_input", False)
 
+    def standardize_audio(self) -> bool:
+        return self.use_audio_input and self.config.get("standardize_audio", False)
+
     @property
     def use_sample_rate(self):
         """Needed by the dataset loader to see if the model requires
@@ -141,8 +144,13 @@ class S2TDataConfig(object):
         return self._auto_convert_to_abs_path(path)
 
     @property
-    def vocoder(self) -> Optional[Dict[str, str]]:
-        return self.config.get("vocoder", None)
+    def vocoder(self) -> Dict[str, str]:
+        vocoder = self.config.get("vocoder", {"type": "griffin_lim"})
+        return self._auto_convert_to_abs_path(vocoder)
+
+    @property
+    def hub(self) -> Dict[str, str]:
+        return self.config.get("hub", {})
 
 
 class S2SDataConfig(S2TDataConfig):

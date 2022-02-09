@@ -202,7 +202,7 @@ class SpeechToSpeechTask(LegacyFairseqTask):
         self.tgt_dict = tgt_dict
         self.data_cfg = S2SDataConfig(Path(args.data) / args.config_yaml)
         self.multitask_tasks = {}
-        if args.multitask_config_yaml:
+        if getattr(args, "multitask_config_yaml", None) is not None:
             multitask_cfg = MultitaskConfig(
                 Path(args.data) / args.multitask_config_yaml
             )
@@ -275,13 +275,13 @@ class SpeechToSpeechTask(LegacyFairseqTask):
     def max_positions(self):
         return self.args.max_source_positions, self.args.max_target_positions
 
-    def build_model(self, args):
+    def build_model(self, args, from_checkpoint=False):
         args.input_feat_per_channel = self.data_cfg.input_feat_per_channel
         args.input_channels = self.data_cfg.input_transformed_channels
         args.target_speaker_embed = self.data_cfg.target_speaker_embed is not None
         args.n_frames_per_step = self.args.n_frames_per_step
 
-        model = super().build_model(args)
+        model = super().build_model(args, from_checkpoint)
 
         if len(self.multitask_tasks) > 0:
             from fairseq.models.speech_to_speech.s2s_transformer import (
